@@ -93,3 +93,11 @@ rg -n "registerSharedClass\\(L," src/lua
 - Do not post any PR comments/reviews automatically.
 - Only post PR comments/reviews when the user explicitly asks.
 - All PR comments/reviews posted by me must be in English.
+
+## Repository Map
+
+- `src/` is the native server core; see `src/AGENTS.md` for subsystem and CMake boundaries.
+- `data/` is the shared Lua/XML runtime layer; see `data/AGENTS.md`.
+- `data-otservbr-global/` is the large global datapack; see its local `AGENTS.md` before changing world content.
+- `tests/` contains native unit/integration suites; see `tests/AGENTS.md` for discovery, database, and stale-script caveats.
+- Root startup is `src/main.cpp`; normal local builds use CMake presets, not a root-level Makefile.

@@ -250,6 +250,35 @@ set_lua_number "statusTimeout" "$CANARY_STATUS_TIMEOUT"
 set_lua_string "dataPackDirectory" "$CANARY_DATA_PACK"
 set_lua_string "mapDownloadUrl" "$CANARY_MAP_URL"
 
+# Player quality-of-life features (always enabled by default)
+# These provide a better experience for single-player / local dev use.
+# Override individually via CANARY_<FEATURE>=false in .env if needed.
+PLAYER_FEATURES_AUTO_LOOT="${CANARY_PLAYER_AUTO_LOOT:-true}"
+PLAYER_FEATURES_AUTO_BANK="${CANARY_PLAYER_AUTO_BANK:-true}"
+PLAYER_FEATURES_FREE_TRAVELS="${CANARY_PLAYER_FREE_TRAVELS:-true}"
+PLAYER_FEATURES_FREE_PREMIUM="${CANARY_PLAYER_FREE_PREMIUM:-true}"
+PLAYER_FEATURES_VIP_SYSTEM="${CANARY_PLAYER_VIP_SYSTEM:-true}"
+PLAYER_FEATURES_STAMINA_TRAINER="${CANARY_PLAYER_STAMINA_TRAINER:-true}"
+
+set_lua_line "autoLoot" "autoLoot = $PLAYER_FEATURES_AUTO_LOOT"
+set_lua_line "autoBank" "autoBank = $PLAYER_FEATURES_AUTO_BANK"
+set_lua_line "toggleTravelsFree" "toggleTravelsFree = $PLAYER_FEATURES_FREE_TRAVELS"
+set_lua_line "staminaTrainer" "staminaTrainer = $PLAYER_FEATURES_STAMINA_TRAINER"
+set_lua_line "freePremium" "freePremium = $PLAYER_FEATURES_FREE_PREMIUM"
+set_lua_line "vipSystemEnabled" "vipSystemEnabled = $PLAYER_FEATURES_VIP_SYSTEM"
+
+# VIP bonuses (only when vipSystemEnabled is on)
+VIP_BONUS_EXP="${CANARY_VIP_BONUS_EXP:-10}"
+VIP_BONUS_LOOT="${CANARY_VIP_BONUS_LOOT:-5}"
+VIP_BONUS_SKILL="${CANARY_VIP_BONUS_SKILL:-5}"
+set_lua_line "vipBonusExp" "vipBonusExp = $VIP_BONUS_EXP"
+set_lua_line "vipBonusLoot" "vipBonusLoot = $VIP_BONUS_LOOT"
+set_lua_line "vipBonusSkill" "vipBonusSkill = $VIP_BONUS_SKILL"
+set_lua_line "vipStayOnline" "vipStayOnline = true"
+set_lua_line "vipKeepHouse" "vipKeepHouse = true"
+set_lua_line "vipAutoLootVipOnly" "vipAutoLootVipOnly = false"
+set_lua_line "vipFamiliarTimeCooldownReduction" "vipFamiliarTimeCooldownReduction = 5"
+
 echo "config.lua updated"
 
 echo ""
