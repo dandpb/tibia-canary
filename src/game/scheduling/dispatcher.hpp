@@ -179,6 +179,10 @@ public:
 		return dispacherContext;
 	}
 
+	[[nodiscard]] bool isShuttingDown() const noexcept {
+		return shuttingDown.load(std::memory_order_acquire);
+	}
+
 private:
 	thread_local static DispatcherContext dispacherContext;
 	struct LaneExecutionResult {
@@ -313,6 +317,7 @@ private:
 	std::atomic<int64_t> queueLatencyLoggingStartedAt = 0;
 
 	friend class CanaryServer;
+	friend class ConnectionWriteDiagnosticsTest;
 };
 
 constexpr auto g_dispatcher = Dispatcher::getInstance;

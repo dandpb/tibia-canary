@@ -24,6 +24,7 @@
 #include "creatures/players/imbuements/imbuements.hpp"
 #include "creatures/players/storages/storages.hpp"
 #include "creatures/players/components/player_forge_history.hpp"
+#include "creatures/players/components/pvp/expert_pvp.hpp"
 #include "server/network/protocol/protocolgame.hpp"
 #include "enums/account_errors.hpp"
 #include "enums/account_group_type.hpp"
@@ -100,6 +101,23 @@ namespace {
 		}
 
 		return false;
+	}
+
+	[[nodiscard]] uint32_t appendMatchingItem(
+		const std::shared_ptr<Item> &item,
+		uint16_t itemId,
+		int32_t subType,
+		std::vector<std::shared_ptr<Item>> &itemList
+	) {
+		if (!item || item->getID() != itemId) {
+			return 0;
+		}
+
+		const auto itemCount = Item::countByType(item, subType);
+		if (itemCount > 0) {
+			itemList.push_back(item);
+		}
+		return itemCount;
 	}
 }
 
@@ -1018,7 +1036,12 @@ bool Player::hasSecureMode() const {
 }
 
 void Player::setParty(std::shared_ptr<Party> newParty) {
+	if (m_party == newParty) {
+		return;
+	}
+
 	m_party = std::move(newParty);
+	ExpertPvp::refreshAllVisibleSituationMarks();
 }
 
 std::shared_ptr<Party> Player::getParty() const {
@@ -1422,7 +1445,20 @@ bool Player::canWalkthrough(const std::shared_ptr<Creature> &creature) {
 
 	if (player) {
 		const auto &playerTile = player->getTile();
-		if (!playerTile || (!playerTile->hasFlag(TILESTATE_NOPVPZONE) && !playerTile->hasFlag(TILESTATE_PROTECTIONZONE) && player->getLevel() > static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) && g_game().getWorldType() != WORLD_TYPE_NO_PVP)) {
+		const bool legacyWalkthroughZone = playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		if (!playerTile) {
+			return false;
+		}
+
+		if (!legacyWalkthroughZone && ExpertPvp::isEnabled()) {
+			const auto relation = ExpertPvp::classifyRelation(player, getPlayer());
+			const auto decision = ExpertPvp::canWalkThrough(relation.facts);
+			if (decision.handled) {
+				return decision.canWalkThrough;
+			}
+		}
+
+		if (!legacyWalkthroughZone) {
 			return false;
 		}
 
@@ -1470,7 +1506,16 @@ bool Player::canWalkthroughEx(const std::shared_ptr<Creature> &creature) const {
 	const auto &npc = creature->getNpc();
 	if (player) {
 		const auto &playerTile = player->getTile();
-		return playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		const bool legacyWalkthroughZone = playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		if (playerTile && !legacyWalkthroughZone && ExpertPvp::isEnabled()) {
+			const auto relation = ExpertPvp::classifyRelation(player, getPlayer());
+			const auto decision = ExpertPvp::canWalkThrough(relation.facts);
+			if (decision.handled) {
+				return decision.canWalkThrough;
+			}
+		}
+
+		return legacyWalkthroughZone;
 	} else if (npc) {
 		const auto &tile = npc->getTile();
 		const auto &houseTile = std::dynamic_pointer_cast<HouseTile>(tile);
@@ -2146,8 +2191,12 @@ void Player::sendPlayerVocation(const std::shared_ptr<Player> &player) const {
 }
 
 void Player::sendDistanceShoot(const Position &from, const Position &to, uint16_t type) const {
+	sendDistanceShoot(from, to, type, SourceEffect_t::OWN);
+}
+
+void Player::sendDistanceShoot(const Position &from, const Position &to, uint16_t type, SourceEffect_t source) const {
 	if (client) {
-		client->sendDistanceShoot(from, to, type);
+		client->sendDistanceShoot(from, to, type, source);
 	}
 }
 
@@ -2241,8 +2290,12 @@ void Player::sendGameNews() const {
 }
 
 void Player::sendMagicEffect(const Position &pos, uint16_t type) const {
+	sendMagicEffect(pos, type, SourceEffect_t::OWN);
+}
+
+void Player::sendMagicEffect(const Position &pos, uint16_t type, SourceEffect_t source) const {
 	if (client) {
-		client->sendMagicEffect(pos, type);
+		client->sendMagicEffect(pos, type, source);
 	}
 }
 
@@ -4386,6 +4439,51 @@ std::shared_ptr<Item> Player::getCorpse(const std::shared_ptr<Creature> &lastHit
 	return corpse;
 }
 
+void Player::addPzLockTicks() {
+	if (hasFlag(PlayerFlags_t::NotGainInFight)) {
+		return;
+	}
+
+	const auto duration = static_cast<uint32_t>(g_configManager().getNumber(PZ_LOCKED));
+	const auto expiresAt = OTSYS_TIME() + duration;
+	if (pzLockOnlyUntil >= expiresAt) {
+		return;
+	}
+
+	pzLockOnlyUntil = expiresAt;
+	pzLocked = true;
+	sendIcons();
+	if (pzLockEventId != 0) {
+		g_dispatcher().stopEvent(pzLockEventId);
+	}
+
+	const auto &task = createPlayerTask(
+		duration,
+		[playerId = getID()] {
+			const auto &player = g_game().getPlayerByID(playerId);
+			if (!player) {
+				return;
+			}
+
+			player->pzLockEventId = 0;
+			if (player->hasCondition(CONDITION_INFIGHT) || player->pzLockOnlyUntil > OTSYS_TIME()) {
+				return;
+			}
+
+			player->pzLockOnlyUntil = 0;
+			if (player->pzLocked) {
+				player->pzLocked = false;
+				player->sendIcons();
+			}
+			if (player->getSkull() != SKULL_RED && player->getSkull() != SKULL_BLACK) {
+				player->setSkull(SKULL_NONE);
+			}
+		},
+		__FUNCTION__
+	);
+	pzLockEventId = g_dispatcher().scheduleEvent(task);
+}
+
 void Player::addInFightTicks(bool pzlock /*= false*/) {
 	wheel().checkAbilities();
 
@@ -4394,6 +4492,7 @@ void Player::addInFightTicks(bool pzlock /*= false*/) {
 	}
 
 	if (pzlock) {
+		pzLockOnlyUntil = 0;
 		pzLocked = true;
 		sendIcons();
 	}
@@ -5050,14 +5149,21 @@ size_t Player::getLastIndex() const {
 }
 
 uint32_t Player::getItemTypeCount(uint16_t itemId, int32_t subType /*= -1*/) const {
+	return getItemTypeCount(itemId, subType, false, false);
+}
+
+uint32_t Player::getItemTypeCount(uint16_t itemId, int32_t subType, bool ignoreEquipped, bool ignoreStoreInbox) const {
 	uint32_t count = 0;
 	for (int32_t i = CONST_SLOT_FIRST; i <= CONST_SLOT_LAST; i++) {
+		if (ignoreStoreInbox && i == CONST_SLOT_STORE_INBOX) {
+			continue;
+		}
 		const auto &item = inventory[i];
 		if (!item) {
 			continue;
 		}
 
-		if (item->getID() == itemId) {
+		if (!ignoreEquipped && item->getID() == itemId) {
 			count += Item::countByType(item, subType);
 		}
 
@@ -5183,7 +5289,7 @@ void Player::stashContainer(const StashContainerList &itemDict) {
 	}
 }
 
-bool Player::removeItemOfType(uint16_t itemId, uint32_t amount, int32_t subType, bool ignoreEquipped /* = false*/) const {
+bool Player::removeItemOfType(uint16_t itemId, uint32_t amount, int32_t subType, bool ignoreEquipped /* = false*/, bool ignoreStoreInbox /* = false*/) const {
 	if (amount == 0) {
 		return true;
 	}
@@ -5192,44 +5298,33 @@ bool Player::removeItemOfType(uint16_t itemId, uint32_t amount, int32_t subType,
 
 	uint32_t count = 0;
 	for (int32_t i = CONST_SLOT_FIRST; i <= CONST_SLOT_LAST; i++) {
+		if (ignoreStoreInbox && i == CONST_SLOT_STORE_INBOX) {
+			continue;
+		}
 		const auto &item = inventory[i];
 		if (!item) {
 			continue;
 		}
 
 		if (!ignoreEquipped && item->getID() == itemId) {
-			const uint32_t itemCount = Item::countByType(item, subType);
-			if (itemCount == 0) {
-				continue;
-			}
-
-			itemList.emplace_back(item);
-
-			count += itemCount;
+			count += appendMatchingItem(item, itemId, subType, itemList);
 			if (count >= amount) {
 				g_game().internalRemoveItems(itemList, amount, Item::items[itemId].stackable);
 				return true;
 			}
-		} else if (const auto &container = item->getContainer()) {
-			for (ContainerIterator it = container->iterator(); it.hasNext(); it.advance()) {
-				const auto &containerItem = *it;
-				if (containerItem->getID() == itemId) {
-					const uint32_t itemCount = Item::countByType(containerItem, subType);
-					if (itemCount == 0) {
-						continue;
-					}
+			continue;
+		}
 
-					itemList.emplace_back(containerItem);
+		const auto &container = item->getContainer();
+		if (!container) {
+			continue;
+		}
 
-					count += itemCount;
-					const auto stackable = Item::items[itemId].stackable;
-					// If the amount of items in the backpack is equal to or greater than the amount
-					// It will remove items and stop the iteration
-					if (count >= amount) {
-						g_game().internalRemoveItems(itemList, amount, stackable);
-						return true;
-					}
-				}
+		for (ContainerIterator it = container->iterator(); it.hasNext(); it.advance()) {
+			count += appendMatchingItem(*it, itemId, subType, itemList);
+			if (count >= amount) {
+				g_game().internalRemoveItems(itemList, amount, Item::items[itemId].stackable);
+				return true;
 			}
 		}
 	}
@@ -6128,6 +6223,14 @@ void Player::setSecureMode(bool mode) {
 	secureMode = mode;
 }
 
+void Player::setPvpMode(PvpMode_t mode) {
+	(void)m_pvpPlayer.setMode(mode);
+}
+
+PvpMode_t Player::getPvpMode() const {
+	return m_pvpPlayer.getMode();
+}
+
 Faction_t Player::getFaction() const {
 	return faction;
 }
@@ -6308,11 +6411,17 @@ void Player::onEndCondition(ConditionType_t type) {
 	const auto &conditionFight = getCondition(CONDITION_INFIGHT);
 	if (type == CONDITION_INFIGHT && !conditionFight) {
 		onIdleStatus();
-		pzLocked = false;
+		const bool hasPzLockOnly = pzLockOnlyUntil > OTSYS_TIME();
+		if (hasPzLockOnly) {
+			pzLocked = true;
+		} else {
+			pzLockOnlyUntil = 0;
+			pzLocked = false;
+		}
 		clearAttacked();
 		sendOpenPvpSituations();
 
-		if (getSkull() != SKULL_RED && getSkull() != SKULL_BLACK) {
+		if (!hasPzLockOnly && getSkull() != SKULL_RED && getSkull() != SKULL_BLACK) {
 			setSkull(SKULL_NONE);
 		}
 	}
@@ -6377,7 +6486,7 @@ void Player::onAttackedCreature(const std::shared_ptr<Creature> &target) {
 	}
 
 	const auto &targetPlayer = target->getPlayer();
-	if (targetPlayer && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
+	if (targetPlayer && !ExpertPvp::isEnabled() && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
 		if (!pzLocked && g_game().getWorldType() == WORLD_TYPE_PVP_ENFORCED) {
 			pzLocked = true;
 			sendIcons();
@@ -6494,7 +6603,7 @@ bool Player::onKilledPlayer(const std::shared_ptr<Player> &target, bool lastHit)
 				for (auto &kill : target->unjustifiedKills) {
 					if (kill.target == getGUID() && kill.unavenged) {
 						kill.unavenged = false;
-						attackedSet.erase(target->guid);
+						removeAttacked(target);
 						break;
 					}
 				}
@@ -6581,6 +6690,7 @@ bool Player::onKilledMonster(const std::shared_ptr<Monster> &monster) {
 		return false;
 	}
 	if (!monster->getSoulPit()) {
+		g_callbacks().executeCallback(EventCallback_t::playerOnKill, getPlayer(), monster);
 		addHuntingTaskKill(mType);
 		addBestiaryKill(mType);
 		addBosstiaryKill(mType);
@@ -7102,12 +7212,24 @@ bool Player::hasAttacked(const std::shared_ptr<Player> &attacked) const {
 	return attackedSet.contains(attacked->guid);
 }
 
+const phmap::flat_hash_set<uint32_t> &Player::getAttackedPlayerGuids() const {
+	return attackedSet;
+}
+
+const phmap::flat_hash_set<uint32_t> &Player::getAttackerPlayerGuids() const {
+	return attackerSet;
+}
+
 void Player::addAttacked(const std::shared_ptr<Player> &attacked) {
 	if (hasFlag(PlayerFlags_t::NotGainInFight) || !attacked || attacked == getPlayer()) {
 		return;
 	}
 
-	attackedSet.emplace(attacked->guid);
+	const auto [iterator, inserted] = attackedSet.emplace(attacked->guid);
+	(void)iterator;
+	if (inserted) {
+		(void)attacked->attackerSet.emplace(guid);
+	}
 }
 
 void Player::removeAttacked(const std::shared_ptr<Player> &attacked) {
@@ -7115,11 +7237,27 @@ void Player::removeAttacked(const std::shared_ptr<Player> &attacked) {
 		return;
 	}
 
-	attackedSet.erase(attacked->guid);
+	if (attackedSet.erase(attacked->guid) == 0) {
+		return;
+	}
+
+	(void)attacked->attackerSet.erase(guid);
+	if (ExpertPvp::isEnabled()) {
+		ExpertPvp::refreshVisibleSituationMarks(static_self_cast<Player>(), attacked);
+	}
 }
 
 void Player::clearAttacked() {
+	const bool shouldRefreshExpertMarks = ExpertPvp::isEnabled() && !attackedSet.empty();
+	for (const auto attackedGuid : attackedSet) {
+		if (const auto &attacked = g_game().getPlayerByGUID(attackedGuid)) {
+			(void)attacked->attackerSet.erase(guid);
+		}
+	}
 	attackedSet.clear();
+	if (shouldRefreshExpertMarks) {
+		ExpertPvp::refreshAllVisibleSituationMarks();
+	}
 }
 
 void Player::addUnjustifiedDead(const std::shared_ptr<Player> &attacked) {
@@ -7228,7 +7366,7 @@ double Player::getLostPercent() const {
 		return std::max<int32_t>(0, deathLosePercent) / 100.;
 	}
 
-	bool isRetro = g_configManager().getBoolean(TOGGLE_SERVER_IS_RETRO);
+	bool isRetro = ExpertPvp::isRetroPvpWorldType();
 	const auto factor = (isRetro ? 6.31 : 8);
 	double percentReduction = (blessingCount * factor) / 100.;
 
@@ -8714,6 +8852,12 @@ void Player::sendCreatureSquare(const std::shared_ptr<Creature> &creature, Squar
 	}
 }
 
+void Player::sendCreatureMark(const std::shared_ptr<Creature> &creature, CreatureMark_t mark) const {
+	if (client) {
+		client->sendCreatureMark(creature, mark);
+	}
+}
+
 void Player::sendCreatureChangeOutfit(const std::shared_ptr<Creature> &creature, const Outfit_t &outfit) const {
 	if (client) {
 		client->sendCreatureOutfit(creature, outfit);
@@ -8765,6 +8909,64 @@ void Player::sendCreatureLight(const std::shared_ptr<Creature> &creature) const 
 void Player::sendCreatureIcon(const std::shared_ptr<Creature> &creature) const {
 	if (client && !client->oldProtocol) {
 		client->sendCreatureIcon(creature);
+	}
+}
+
+bool Player::setRaceIconOverlay(uint16_t raceId, CreatureIconModifications_t icon, bool enabled) {
+	if (raceId == 0 || icon == CreatureIconModifications_t::None || !magic_enum::enum_contains(icon)) {
+		return false;
+	}
+
+	if (enabled) {
+		return m_raceIconOverlays[raceId].insert(icon).second;
+	}
+
+	const auto raceIt = m_raceIconOverlays.find(raceId);
+	if (raceIt == m_raceIconOverlays.end() || raceIt->second.erase(icon) == 0) {
+		return false;
+	}
+	if (raceIt->second.empty()) {
+		static_cast<void>(m_raceIconOverlays.erase(raceIt));
+	}
+	return true;
+}
+
+bool Player::clearRaceIconOverlays(CreatureIconModifications_t icon) {
+	if (icon == CreatureIconModifications_t::None || !magic_enum::enum_contains(icon)) {
+		return false;
+	}
+
+	bool changed = false;
+	for (auto &[_, overlays] : m_raceIconOverlays) {
+		changed = overlays.erase(icon) > 0 || changed;
+	}
+	static_cast<void>(std::erase_if(m_raceIconOverlays, [](const auto &entry) {
+		return entry.second.empty();
+	}));
+	return changed;
+}
+
+std::vector<CreatureIcon> Player::getRaceIconOverlays(uint16_t raceId) const {
+	std::vector<CreatureIcon> icons;
+	const auto raceIt = m_raceIconOverlays.find(raceId);
+	if (raceIt == m_raceIconOverlays.end()) {
+		return icons;
+	}
+
+	icons.reserve(raceIt->second.size());
+	for (const auto icon : raceIt->second) {
+		icons.push_back(CreatureIcon { icon });
+	}
+	return icons;
+}
+
+void Player::refreshVisibleCreatureIcons() const {
+	if (!client || client->oldProtocol) {
+		return;
+	}
+
+	for (const auto &creature : Spectators().find<Creature>(getPosition(), false, MAP_MAX_CLIENT_VIEW_PORT_X, MAP_MAX_CLIENT_VIEW_PORT_X, MAP_MAX_CLIENT_VIEW_PORT_Y, MAP_MAX_CLIENT_VIEW_PORT_Y)) {
+		sendCreatureIcon(creature);
 	}
 }
 
@@ -9116,6 +9318,7 @@ void Player::setGuild(const std::shared_ptr<Guild> &newGuild) {
 		return;
 	}
 
+	const auto oldGuild = guild;
 	if (guild) {
 		guild->removeMember(static_self_cast<Player>());
 		guild = nullptr;
@@ -9127,12 +9330,19 @@ void Player::setGuild(const std::shared_ptr<Guild> &newGuild) {
 	if (newGuild) {
 		const auto &rank = newGuild->getRankByLevel(1);
 		if (!rank) {
+			if (oldGuild != guild) {
+				ExpertPvp::refreshAllVisibleSituationMarks();
+			}
 			return;
 		}
 
 		guild = newGuild;
 		guildRank = rank;
 		newGuild->addMember(static_self_cast<Player>());
+	}
+
+	if (oldGuild != guild) {
+		ExpertPvp::refreshAllVisibleSituationMarks();
 	}
 }
 
@@ -11346,10 +11556,20 @@ void Player::forgeTransferItemTier(ForgeAction_t actionType, uint16_t donorItemI
 		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
 		return;
 	}
+	if (!convergence && donorItem->getTier() == 0) {
+		g_logger().error("[{}] Player {} tried to transfer a tier-0 donor item", __FUNCTION__, getName());
+		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
+		return;
+	}
 
 	const auto &receiveItem = getForgeItemFromId(receiveItemId, 0, donorItem);
 	if (!receiveItem) {
 		g_logger().error("[Log 2] Player with name {} failed to transfer item with id {}", getName(), receiveItemId);
+		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
+		return;
+	}
+	if (donorItem->getClassification() != receiveItem->getClassification()) {
+		g_logger().error("[{}] Player {} tried to transfer item classification {} to classification {}", __FUNCTION__, getName(), donorItem->getClassification(), receiveItem->getClassification());
 		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
 		return;
 	}
@@ -11371,15 +11591,17 @@ void Player::forgeTransferItemTier(ForgeAction_t actionType, uint16_t donorItemI
 			continue;
 		}
 		hasMatchingClassification = true;
-		const uint8_t toTier = convergence ? donorItem->getTier() : donorItem->getTier() - 1;
-		if (!itemClassification->tiers.contains(toTier)) {
-			g_logger().error("[{}] Failed to find tier {} for item {} in classification {}", __FUNCTION__, toTier, donorItem->getClassification(), itemClassification->id);
+		const uint8_t donorTier = donorItem->getTier();
+		const uint8_t toTier = convergence ? donorTier : donorTier - 1;
+		if (!itemClassification->tiers.contains(toTier) || !itemClassification->tiers.contains(donorTier)) {
+			g_logger().error("[{}] Failed to find donor tier {} or result tier {} for item {} in classification {}", __FUNCTION__, donorTier, toTier, donorItem->getClassification(), itemClassification->id);
 			sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
 			return;
 		}
-		const auto &tierPrices = itemClassification->tiers.at(toTier);
-		cost = convergence ? tierPrices.convergenceTransferPrice : tierPrices.regularPrice;
-		coresAmount = tierPrices.corePrice;
+		const auto &resultTierPrices = itemClassification->tiers.at(toTier);
+		const auto &donorTierPrices = itemClassification->tiers.at(donorTier);
+		cost = convergence ? resultTierPrices.convergenceTransferPrice : donorTierPrices.regularPrice;
+		coresAmount = resultTierPrices.corePrice;
 		break;
 	}
 	if (!hasMatchingClassification) {
@@ -13023,15 +13245,17 @@ Virtue_t Player::getVirtue() const {
 	return virtue;
 }
 
-void Player::setVirtue(Virtue_t newVirtue) {
+void Player::setVirtue(Virtue_t newVirtue, bool notifyClient /* = true */) {
 	if (virtue == newVirtue) {
 		return;
 	}
 
 	virtue = newVirtue;
 
-	sendSkills();
-	sendMonkData(MonkData_t::Virtue, enumToValue(virtue));
+	if (notifyClient) {
+		sendSkills();
+		sendMonkData(MonkData_t::Virtue, enumToValue(virtue));
+	}
 }
 
 void Player::setSerene(bool b, int32_t ticks /* = -1 */) {

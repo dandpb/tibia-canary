@@ -306,10 +306,13 @@ namespace {
 		for (const auto &spellTable : spellsTable) {
 			auto size = std::ssize(spellTable.grade);
 			g_logger().debug("spell area stage {}, grade {}", stage, size);
-			if (spellTable.name == spellName && stage < static_cast<uint8_t>(size)) {
-				const auto &spellData = spellTable.grade[stage];
-				if (spellData.increase.area) {
-					g_logger().debug("[{}] spell with name {}, and stage {} has increase area", __FUNCTION__, spellName, stage);
+			if (spellTable.name != spellName || stage >= static_cast<uint8_t>(size)) {
+				continue;
+			}
+
+			for (auto grade = stage; grade > 0; --grade) {
+				if (spellTable.grade[grade].increase.area) {
+					g_logger().debug("[{}] spell with name {}, stage {}, and grade {} has increase area", __FUNCTION__, spellName, stage, grade);
 
 					return true;
 				}
@@ -324,10 +327,14 @@ namespace {
 		for (const auto &spellTable : spellsTable) {
 			auto size = std::ssize(spellTable.grade);
 			g_logger().debug("spell target stage {}, grade {}", stage, size);
-			if (spellTable.name == spellName && stage < static_cast<uint8_t>(size)) {
-				const auto &spellData = spellTable.grade[stage];
-				if (spellData.increase.additionalTarget) {
-					return spellData.increase.additionalTarget;
+			if (spellTable.name != spellName || stage >= static_cast<uint8_t>(size)) {
+				continue;
+			}
+
+			for (auto grade = stage; grade > 0; --grade) {
+				const auto additionalTarget = spellTable.grade[grade].increase.additionalTarget;
+				if (additionalTarget) {
+					return additionalTarget;
 				}
 			}
 		}
@@ -340,10 +347,14 @@ namespace {
 		for (const auto &spellTable : spellsTable) {
 			auto size = std::ssize(spellTable.grade);
 			g_logger().debug("spell duration stage {}, grade {}", stage, size);
-			if (spellTable.name == spellName && stage < static_cast<uint8_t>(size)) {
-				const auto &spellData = spellTable.grade[stage];
-				if (spellData.increase.duration > 0) {
-					return spellData.increase.duration;
+			if (spellTable.name != spellName || stage >= static_cast<uint8_t>(size)) {
+				continue;
+			}
+
+			for (auto grade = stage; grade > 0; --grade) {
+				const auto duration = spellTable.grade[grade].increase.duration;
+				if (duration > 0) {
+					return duration;
 				}
 			}
 		}
@@ -1247,7 +1258,22 @@ void PlayerWheel::destroyGem(uint16_t index) {
 	}
 
 	m_destroyedGems.emplace_back(gem);
+	gem.remove(gemsKV());
+
+	bool removedActiveGem = false;
+	for (const auto affinity : magic_enum::enum_values<WheelGemAffinity_t>()) {
+		auto &activeGem = m_activeGems[static_cast<uint8_t>(affinity)];
+		if (activeGem && activeGem.uuid == gem.uuid) {
+			activeGem = emptyGem;
+			gemsKV()->scoped("active")->remove(std::string(magic_enum::enum_name(affinity)));
+			removedActiveGem = true;
+		}
+	}
+
 	m_revealedGems.erase(m_revealedGems.begin() + index);
+	if (removedActiveGem) {
+		loadPlayerBonusData();
+	}
 
 	const auto totalLesserFragment = m_player.getItemTypeCount(ITEM_LESSER_FRAGMENT) + m_player.getStashItemCount(ITEM_LESSER_FRAGMENT);
 	const auto totalGreaterFragment = m_player.getItemTypeCount(ITEM_GREATER_FRAGMENT) + m_player.getStashItemCount(ITEM_GREATER_FRAGMENT);
@@ -1933,7 +1959,7 @@ uint16_t PlayerWheel::getExtraPoints() const {
 		return 0;
 	}
 
-	uint16_t totalBonus = 0;
+	uint32_t totalBonus = 0;
 	for (const auto &[itemId, name, extraPoints] : m_unlockedScrolls) {
 		if (itemId == 0) {
 			continue;
@@ -1942,12 +1968,25 @@ uint16_t PlayerWheel::getExtraPoints() const {
 		totalBonus += extraPoints;
 	}
 
+	const auto taskBoardMultiplier = m_player.kv()->scoped("task-board")->scoped("wheel")->get("multiplier");
+	if (taskBoardMultiplier.has_value()) {
+		const auto configuredMultiplier = taskBoardMultiplier->getNumber();
+		if (std::isfinite(configuredMultiplier)) {
+			// The persisted value is the next purchasable offer, so 51 represents
+			// the terminal state after all 50 Promotion Points were purchased.
+			const auto normalizedMultiplier = std::clamp(configuredMultiplier, 1.0, 51.0);
+			if (normalizedMultiplier > 1.0) {
+				totalBonus += static_cast<uint16_t>(std::floor(normalizedMultiplier) - 1.0);
+			}
+		}
+	}
+
 	if (hasCompletedMonkQuest()) {
 		const auto monkQuestBonus = std::max<int32_t>(0, g_configManager().getNumber(WHEEL_MONK_QUEST_BONUS));
 		totalBonus += static_cast<uint16_t>(std::min<int32_t>(monkQuestBonus, 0xFFFF));
 	}
 
-	return totalBonus;
+	return static_cast<uint16_t>(std::min<uint32_t>(totalBonus, std::numeric_limits<uint16_t>::max()));
 }
 
 uint16_t PlayerWheel::getWheelPoints(bool includeExtraPoints /* = true*/) const {
